@@ -1,0 +1,241 @@
+// This is a draft for a Multi Timeframe validation Strategy V2
+
+//@version=6
+strategy("Multi-TF Momentum Strategy v2.0", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=3)
+
+// === ⏱️ Timeframes ===
+tf_m1  = "1"
+tf_m5  = "5"
+tf_m15 = "15"
+main_tf = "5"
+ha_tf = "1"
+
+// === ⚙️ Inputs ===
+adxThresh_m1  = input.float(12.7, "ADX Threshold M1")
+adxThresh_m5  = input.float(14.3, "ADX Threshold M5")
+adxThresh_m15 = input.float(17.1, "ADX Threshold M15")
+
+slMultiplier = input.float(2.15, "SL Multiplier")
+atrMult = input.float(2.575, "ATR Multiplier")
+barsToTimeout = input.int(100, "Bars to Timeout")
+
+// === 🟦 Core Request-Data ===
+getTFData(tf) =>
+    close_ = request.security(syminfo.tickerid, tf, close)
+    high_ = request.security(syminfo.tickerid, tf, high)
+    low_ = request.security(syminfo.tickerid, tf, low)
+    open_ = request.security(syminfo.tickerid, tf, open)
+    [open_, high_, low_, close_]
+
+// === 🔁 Custom ADX ===
+getADX(tf, len) =>
+    upMove   = request.security(syminfo.tickerid, tf, ta.change(high))
+    downMove = request.security(syminfo.tickerid, tf, -ta.change(low))
+    plusDM  = na(upMove) or upMove < 0 or upMove <= downMove ? 0 : upMove
+    minusDM = na(downMove) or downMove < 0 or downMove < upMove ? 0 : downMove
+    tr = request.security(syminfo.tickerid, tf, ta.tr)
+    smoothedTR  = ta.rma(tr, len)
+    smoothedPlusDM  = ta.rma(plusDM, len)
+    smoothedMinusDM = ta.rma(minusDM, len)
+    plusDI  = 100 * smoothedPlusDM  / smoothedTR
+    minusDI = 100 * smoothedMinusDM / smoothedTR
+    dx = 100 * math.abs(plusDI - minusDI) / (plusDI + minusDI)
+    adx = ta.rma(dx, len)
+    adx
+
+// === 📊 Trendlogik mit ADX + EMA + MACD
+getTrend(tf, adxThresh) =>
+    ema50 = request.security(syminfo.tickerid, tf, ta.ema(close, 50))
+    ema200 = request.security(syminfo.tickerid, tf, ta.ema(close, 200))
+    [macdLine, signalLine, _] = request.security(syminfo.tickerid, tf, ta.macd(close, 12, 26, 9))
+    macdHist = macdLine - signalLine
+    adxVal = getADX(tf, 14)
+    trendUp = ema50 > ema200 and macdHist > 0 and adxVal > adxThresh
+    trendDown = ema50 < ema200 and macdHist < 0 and adxVal > adxThresh
+    [trendUp, trendDown, adxVal]
+
+// === Trend-Status erfassen
+[trendUp_m1, trendDown_m1, adx_m1]   = getTrend(tf_m1, adxThresh_m1)
+[trendUp_m5, trendDown_m5, adx_m5]   = getTrend(tf_m5, adxThresh_m5)
+[trendUp_m15, trendDown_m15, adx_m15] = getTrend(tf_m15, adxThresh_m15)
+
+// === ADX Normalisierung
+adxRaw = adx_m5
+adxNorm = math.min(math.max((adxRaw - 12) / (48 - 14), 0), 1)
+
+// === 📈 Gewichtete Score Berechnung
+longScore = (trendUp_m1 ? 1 : 0) + (trendUp_m5 ? 1.5 : 0) + (trendUp_m15 ? 2 : 0)
+shortScore = (trendDown_m1 ? 1 : 0) + (trendDown_m5 ? 1.5 : 0) + (trendDown_m15 ? 2 : 0)
+
+// === ✅ Bestätigte Trendkombination
+validComboLong  = (trendUp_m5 and trendUp_m15)
+validComboShort = (trendDown_m5 and trendDown_m15)
+blockLong  = trendUp_m1 and trendUp_m15 and not trendUp_m5
+blockShort = trendDown_m1 and trendDown_m15 and not trendDown_m5
+
+// === 📍 Signal finalisieren
+longSignal  = longScore >= 3.5 and validComboLong and not blockLong and adxNorm > 0.27 and ta.rising(adx_m5, 2)
+shortSignal = shortScore >= 3.5 and validComboShort and not blockShort and adxNorm > 0.27 and ta.rising(adx_m5, 2)
+
+// === 📉 Heikin Ashi
+getHeikinAshi(tf) =>
+    o = request.security(syminfo.tickerid, tf, open)
+    h = request.security(syminfo.tickerid, tf, high)
+    l = request.security(syminfo.tickerid, tf, low)
+    c = request.security(syminfo.tickerid, tf, close)
+    haClose = (o + h + l + c) / 4
+    var float haOpen = na
+    haOpen := na(haOpen) ? (o + c) / 2 : (haOpen[1] + haClose[1]) / 2
+    [haOpen, haClose]
+
+[haOpen, haClose] = getHeikinAshi(ha_tf)
+haBearish = haClose < haOpen
+
+// === 📊 Donchian + Ichimoku für TP Score
+donchianUpper = request.security(syminfo.tickerid, main_tf, ta.highest(high, 20))
+donchianLower = request.security(syminfo.tickerid, main_tf, ta.lowest(low, 20))
+dcw = donchianUpper - donchianLower
+dcwFalling = ta.change(dcw) < 0
+
+tenkan = request.security(syminfo.tickerid, main_tf, ta.sma(ta.highest(high, 9) + ta.lowest(low, 9), 2))
+kijun  = request.security(syminfo.tickerid, main_tf, ta.sma(ta.highest(high, 26) + ta.lowest(low, 26), 2))
+priceBelowKijun = close < kijun
+
+adxTP = request.security(syminfo.tickerid, main_tf, getADX(main_tf, 14))
+
+tpScore = 0
+tpScore += haBearish ? 1 : 0
+tpScore += dcwFalling ? 1 : 0
+tpScore += priceBelowKijun ? 2 : 0
+tpScore += ta.rising(adxTP, 2) ? 1 : 0
+
+// === 🌪️ Volatility / Volume Filter
+atrFilter = ta.rising(ta.atr(14), 5)
+volFilter = ta.sma(volume, 20) > ta.sma(volume, 50)
+useVolatilityFilter = input.bool(true, "Use Volatility Filter?")
+
+allowTrade = useVolatilityFilter ? (atrFilter and volFilter) : true
+
+// === 🎯 Entry-Trigger sauberer
+longSignalNow = longSignal and not longSignal[1]
+shortSignalNow = shortSignal and not shortSignal[1]
+
+isLong  = strategy.position_size > 0
+isShort = strategy.position_size < 0
+
+if (longSignalNow and allowTrade and not isLong and not isShort)
+    strategy.entry("Long", strategy.long)
+
+if (shortSignalNow and allowTrade and not isLong and not isShort)
+    strategy.entry("Short", strategy.short)
+
+// === 🔒 Entry-Preise merken
+longEntryPrice  = isLong  ? strategy.position_avg_price : na
+shortEntryPrice = isShort ? strategy.position_avg_price : na
+
+// === 🧮 SL & TP Logik
+atrLen = 14
+atrVal = ta.atr(atrLen)
+
+dynamicTPMult = adxNorm > 0.8 ? 6.0 : adxNorm > 0.6 ? 4.5 : 3.0
+
+// === LONG TP/SL Setup
+tpLong         = longEntryPrice + atrVal * atrMult * dynamicTPMult
+longInitialSL  = longEntryPrice - atrVal * atrMult
+longTrailStart = longEntryPrice + atrVal * 2.875
+longTrailStop  = ta.highest(close, 10) - atrVal * atrMult
+
+// === SHORT TP/SL Setup
+tpShort         = shortEntryPrice - atrVal * atrMult * 3.775
+shortInitialSL  = shortEntryPrice + atrVal * atrMult
+shortTrailStart = shortEntryPrice - atrVal
+shortTrailStop  = ta.lowest(close, 10) + atrVal * atrMult
+
+// === Zeit im Trade (für Timeout)
+longInTrade       = isLong
+shortInTrade      = isShort
+timeInTradeLong   = bar_index - nz(longInTrade ? strategy.opentrades.entry_bar_index(0) : na)
+timeInTradeShort  = bar_index - nz(shortInTrade ? strategy.opentrades.entry_bar_index(0) : na)
+
+// === 🔁 EXIT CONDITIONS – LONG
+exitBE_Long   = close > tpLong
+exitTime_Long = timeInTradeLong >= barsToTimeout and close < longEntryPrice + atrVal * 0.375
+exitScoreLong = tpScore >= 3 and ta.falling(tpScore, 1)
+
+if isLong
+    effectiveLongSL = close > longTrailStart ? longTrailStop : longInitialSL
+
+    if exitBE_Long
+        strategy.exit("BE Long", from_entry="Long", stop=longEntryPrice)
+    else if exitTime_Long
+        strategy.close("Long", comment="⏳ Timeout Long")
+    else if exitScoreLong
+        strategy.close("Long", comment="📉 TP Score Exit Long")
+    else
+        strategy.exit("Long Exit", from_entry="Long",
+          limit=tpLong,
+          stop=effectiveLongSL,
+          trail_points=atrVal * atrMult,
+          trail_offset=atrVal * atrMult)
+
+// === 🔁 EXIT CONDITIONS – SHORT
+exitBE_Short   = close < tpShort
+exitTime_Short = timeInTradeShort >= barsToTimeout and close > shortEntryPrice - atrVal * 0.375
+exitScoreShort = tpScore >= 3 and ta.falling(tpScore, 1)
+
+if isShort
+    effectiveShortSL = close < shortTrailStart ? shortTrailStop : shortInitialSL
+
+    if exitBE_Short
+        strategy.exit("BE Short", from_entry="Short", stop=shortEntryPrice)
+    else if exitTime_Short
+        strategy.close("Short", comment="⏳ Timeout Short")
+    else if exitScoreShort
+        strategy.close("Short", comment="📉 TP Score Exit Short")
+    else
+        strategy.exit("Short Exit", from_entry="Short",
+          limit=tpShort,
+          stop=effectiveShortSL,
+          trail_points=atrVal * atrMult,
+          trail_offset=atrVal * atrMult)
+
+// === ❌ Exit bei Trendbruch (M5)
+ema50_m5 = request.security(syminfo.tickerid, tf_m5, ta.ema(close, 50))
+ema200_m5 = request.security(syminfo.tickerid, tf_m5, ta.ema(close, 200))
+[macdLine_m5, signalLine_m5, _] = request.security(syminfo.tickerid, tf_m5, ta.macd(close, 12, 26, 9))
+macdHist_m5 = macdLine_m5 - signalLine_m5
+
+exitLongCondition  = ema50_m5 < ema200_m5 or macdHist_m5 < 0
+exitShortCondition = ema50_m5 > ema200_m5 or macdHist_m5 > 0
+
+if isLong and exitLongCondition
+    strategy.close("Long", comment="❌ Trendbruch Long")
+
+if isShort and exitShortCondition
+    strategy.close("Short", comment="❌ Trendbruch Short")
+
+// === 🐞 DEBUG MODUS
+debugMode = input.bool(true, "Enable Debug Mode")
+
+plotchar(debugMode and trendUp_m1     ? 1 : na, title="M1 Up", location=location.bottom, color=color.green, offset=-1)
+plotchar(debugMode and trendUp_m5     ? 1 : na, title="M5 Up", location=location.bottom, color=color.green, offset=-2)
+plotchar(debugMode and trendUp_m15    ? 1 : na, title="M15 Up", location=location.bottom, color=color.green, offset=-3)
+
+plotchar(debugMode and trendDown_m1   ? 1 : na, title="M1 Down", location=location.bottom, color=color.red, offset=-1)
+plotchar(debugMode and trendDown_m5   ? 1 : na, title="M5 Down", location=location.bottom, color=color.red, offset=-2)
+plotchar(debugMode and trendDown_m15  ? 1 : na, title="M15 Down", location=location.bottom, color=color.red, offset=-3)
+
+plotchar(debugMode and validComboLong ? 1 : na, title="✔️ Valid Combo Long", location=location.top, color=color.fuchsia, offset=-1)
+plotchar(debugMode and blockLong      ? 1 : na, title="❌ Blocked Long Combo", location=location.top, color=color.orange, offset=-1)
+
+plotchar(debugMode and validComboShort ? 1 : na, title="✔️ Valid Combo Short", location=location.top, color=color.fuchsia, offset=-1)
+plotchar(debugMode and blockShort      ? 1 : na, title="❌ Blocked Short Combo", location=location.top, color=color.orange, offset=-1)
+
+plotshape(debugMode and longSignal,  location=location.belowbar, color=color.lime, style=shape.triangleup,   title="🟢 LongSignal ACTIVE")
+plotshape(debugMode and shortSignal, location=location.abovebar, color=color.red,  style=shape.triangledown, title="🔴 ShortSignal ACTIVE")
+
+plot(debugMode ? longScore  : na, title="Long Score",  color=color.green)
+plot(debugMode ? shortScore : na, title="Short Score", color=color.red)
+plot(debugMode ? adx_m1     : na, title="ADX M1",      color=color.new(color.green, 70))
+plot(debugMode ? adx_m5     : na, title="ADX M5",      color=color.new(color.orange, 70))
+plot(debugMode ? adx_m15    : na, title="ADX M15",     color=color.new(color.red, 70))
