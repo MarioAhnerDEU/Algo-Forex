@@ -1,0 +1,117 @@
+// Scalping Strat w/ high drawdown due to bad SL logic
+
+//@version=5
+strategy("3x SuperTrend Strategy - Optimized", overlay=true, default_qty_type=strategy.percent_of_equity)
+
+// === Inputs ===
+plInput = input.float(3.5, title="P/L Ratio (Risk-Reward)")
+EMAInputlength = input.int(200, title="EMA Length")
+atrMultiplier = input.float(3.0, title="ATR Multiplier for SL")
+tpMultiplier = input.float(5.5, title="ATR Multiplier for TP")
+trailMultiplier = input.float(4.0, title="Trailing Stop Multiplier")
+useSuperTrendTP = input.bool(false, title="Use SuperTrend for TP?")
+
+// Stoch RSI Inputs
+srsiSmoothK = input.int(3, title="Stoch RSI K")
+srsiSmoothD = input.int(3, title="Stoch RSI D")
+srsiLengthRSI = input.int(14, title="Stoch RSI Length")
+srsiLengthStoch = input.int(14, title="Stochastic Length")
+srsiSrc = close
+srsiThresh = input.int(10, title="Stoch RSI Entry Zone +/-")
+
+// SuperTrend Inputs
+stSrc = hl2
+stSlowLength = input.int(14, title="Slow SuperTrend Length")
+stSlowMult = input.float(3.5, title="Slow SuperTrend Multiplier")
+stMedLength = input.int(11, title="Med SuperTrend Length")
+stMedMult = input.float(2.5, title="Med SuperTrend Multiplier")
+stInputchangeATR = input.bool(true, title="Alternate SuperTrend ATR Calculation?")
+
+// Toggles
+showPLTargets = input.bool(true, title="Show P/L Targets?")
+showBuySell = input.bool(true, title="Show Buy/Sell Signals?")
+
+// === SuperTrend Function ===
+superTrend(period, src, mult) =>
+    atrValue = ta.atr(period)
+    up = src - (mult * atrValue)
+    down = src + (mult * atrValue)
+    var float trend = na
+    trend := na(trend[1]) ? 1 : trend[1]
+    trend := trend == -1 and close > down[1] ? 1 : trend == 1 and close < up[1] ? -1 : trend
+    [up, down, trend]
+
+// === Calculate SuperTrends ===
+[stSlowUP, stSlowDN, stSlowTrend] = superTrend(stSlowLength, stSrc, stSlowMult)
+[stMedUP, stMedDN, stMedTrend] = superTrend(stMedLength, stSrc, stMedMult)
+
+// === ATR Calculation for SL & TP ===
+atr = ta.atr(14)
+
+// === Stochastic RSI Calculation ===
+rsiVal = ta.rsi(srsiSrc, srsiLengthRSI)
+stockK = ta.sma(ta.stoch(rsiVal, rsiVal, rsiVal, srsiLengthStoch), srsiSmoothK)
+stockD = ta.sma(stockK, srsiSmoothD)
+
+// === EMA Calculation ===
+emaVal = ta.ema(close, EMAInputlength)
+
+// === Trading Logic ===
+emaTrend = emaVal < close ? 1 : -1
+stCount = stMedTrend + stSlowTrend
+
+// Stoch RSI optimiert
+stochCrossUp = ta.crossover(stockK, stockD) and stockK < srsiThresh
+stochCrossDown = ta.crossunder(stockK, stockD) and stockK > (100 - srsiThresh)
+
+// Entry Conditions
+longCondition = emaTrend > 0 and stochCrossUp and stCount == 2
+shortCondition = emaTrend < 0 and stochCrossDown and stCount == -2
+
+// Stop-Loss Werte
+longStop = longCondition ? close - (atrMultiplier * atr) : na
+shortStop = shortCondition ? close + (atrMultiplier * atr) : na
+
+// === Take-Profit Werte ===
+var float longProfit = na
+var float shortProfit = na
+
+if longCondition
+    potentialTP = close + (tpMultiplier * atr)
+    longProfit := useSuperTrendTP and stSlowUP > potentialTP ? stSlowUP : potentialTP
+
+if shortCondition
+    potentialTP = close - (tpMultiplier * atr)
+    shortProfit := useSuperTrendTP and stSlowDN < potentialTP ? stSlowDN : potentialTP
+
+// Positionsgrößen-Berechnung
+riskPercent = input.float(2.5, title="Risk per Trade (%)") / 100
+riskAmount = strategy.equity * riskPercent
+positionSize = riskAmount / (atrMultiplier * atr)
+
+// === Strategy Execution ===
+if longCondition
+    strategy.entry("LongPos", strategy.long, qty=positionSize)
+strategy.exit("Exit Long", from_entry="LongPos", stop=longStop, limit=longProfit, 
+     trail_points=atr * trailMultiplier, trail_offset=atr * 1.5)
+
+if shortCondition
+    strategy.entry("ShortPos", strategy.short, qty=positionSize)
+strategy.exit("Exit Short", from_entry="ShortPos", stop=shortStop, limit=shortProfit, 
+     trail_points=atr * trailMultiplier, trail_offset=atr * 1.5)
+
+// === Visualization ===
+plot(emaVal, title="EMA 200", color=color.blue)
+plot(stSlowTrend == 1 ? stSlowUP : na, title="Slow Up Trend", style=plot.style_line, linewidth=2, color=color.green)
+plot(stSlowTrend == -1 ? stSlowDN : na, title="Slow Down Trend", style=plot.style_line, linewidth=2, color=color.red)
+
+plot(stMedTrend == 1 ? stMedUP : na, title="Med Up Trend", style=plot.style_line, linewidth=2, color=color.green)
+plot(stMedTrend == -1 ? stMedDN : na, title="Med Down Trend", style=plot.style_line, linewidth=2, color=color.red)
+
+// Buy/Sell Indicators
+plotshape(showBuySell and longCondition ? true : na, title="Buy", location=location.belowbar, color=color.green, style=shape.labelup)
+plotshape(showBuySell and shortCondition ? true : na, title="Sell", location=location.abovebar, color=color.red, style=shape.labeldown)
+
+// Alerts
+alertcondition(longCondition, title="Buy Signal", message="Buy triggered!")
+alertcondition(shortCondition, title="Sell Signal", message="Sell triggered!")
